@@ -7,6 +7,10 @@ import bcrypt
 from datetime import datetime, timezone
 import pandas as pd
 import re
+import random
+import string
+import io
+import altair as alt
 
 st.set_page_config(page_title="KinderJoy — Streamlit + MongoDB", layout="wide")
 
@@ -25,6 +29,14 @@ def valid_username(u: str) -> bool:
 
 def now_utc():
     return datetime.now(timezone.utc)
+
+def normalize_text(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.strip()
+    # basic normalization: lowercase and collapse whitespace
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
 
 # ---------- DB connection (from Streamlit secrets) ----------
 @st.cache_resource
@@ -61,7 +73,7 @@ def ensure_admin_from_secrets():
     if users_col.find_one({"role": "Admin"}):
         return
 
-    init = st.secrets.get("initial_admin", {})
+    init = st.secrets.get("initial_admin", {}) or {}
     username = init.get("username")
     password = init.get("password")
 
@@ -99,7 +111,10 @@ def login_user(username: str, password: str):
     auth_event = {"username": username, "time": now_utc(), "success": False}
     if not u:
         auth_event["note"] = "not_found"
-        auth_events_col.insert_one(auth_event)
+        try:
+            auth_events_col.insert_one(auth_event)
+        except Exception:
+            pass
         return False, "User not found"
     if verify_password(password, u.get("password", "")):
         st.session_state.user = {
@@ -109,13 +124,19 @@ def login_user(username: str, password: str):
             "role": u.get("role", "User")
         }
         auth_event["success"] = True
-        auth_events_col.insert_one(auth_event)
+        try:
+            auth_events_col.insert_one(auth_event)
+        except Exception:
+            pass
         if u.get("meta", {}).get("must_change_password"):
             return True, "Logged in — please change your temporary password."
         return True, "Login successful"
     else:
         auth_event["note"] = "invalid_password"
-        auth_events_col.insert_one(auth_event)
+        try:
+            auth_events_col.insert_one(auth_event)
+        except Exception:
+            pass
         return False, "Invalid password"
 
 def logout_user():
@@ -189,17 +210,115 @@ if user["role"] == "Admin":
     try:
         users = list(users_col.find({}, {"password": 0}))
         if users:
-            df = pd.DataFrame([{
+            df_users = pd.DataFrame([{
                 "Name": u.get("name"),
                 "Username": u.get("username"),
                 "Role": u.get("role"),
                 "Created": u.get("created_at")
             } for u in users])
-            st.dataframe(df)
+            st.dataframe(df_users)
         else:
             st.info("No users found.")
     except Exception as e:
         st.error(f"Could not fetch users: {e}")
+
+    st.markdown("---")
+    # ---------- Sample Data Population (Admin) ----------
+    st.subheader("Sample Data Tools (Admin)")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Insert 20 Sample Data Rows"):
+            samples = []
+            for i in range(20):
+                txt = ''.join(random.choice(string.ascii_letters + " ") for _ in range(8)).strip()
+                txt = txt or "sample"
+                samples.append({
+                    "user_id": "sample_user_id",
+                    "username": "sample_user",
+                    "input": txt,
+                    "output": txt[::-1],
+                    "created_at": now_utc()
+                })
+            try:
+                results_col.insert_many(samples)
+                st.success("20 sample rows inserted!")
+            except Exception as e:
+                st.error(f"Could not insert sample data: {e}")
+
+    with col2:
+        if st.button("Clear All Sample Results (username=sample_user)"):
+            try:
+                res = results_col.delete_many({"username": "sample_user"})
+                st.success(f"Deleted {res.deleted_count} sample rows.")
+            except Exception as e:
+                st.error(f"Delete failed: {e}")
+
+    st.markdown("---")
+    # ---------- Admin: View & Analyze All Results ----------
+    st.subheader("All Results (Admin view & analysis)")
+    try:
+        all_results = list(results_col.find({}).sort([("_id", -1)]).limit(1000))
+        if not all_results:
+            st.info("No results in DB yet.")
+        else:
+            df_all = pd.DataFrame(all_results)
+            # drop large columns if present
+            if "_id" in df_all.columns:
+                df_all["_id_str"] = df_all["_id"].astype(str)
+            # Normalize and clean
+            df_all["input"] = df_all.get("input", "").apply(lambda x: normalize_text(x) if pd.notna(x) else "")
+            df_all["output"] = df_all.get("output", "").apply(lambda x: normalize_text(x) if pd.notna(x) else "")
+            df_all["created_at"] = pd.to_datetime(df_all["created_at"], errors="coerce")
+            df_all["input_length"] = df_all["input"].apply(lambda x: len(x) if pd.notna(x) else 0)
+
+            st.write("Preview of recent results")
+            st.dataframe(df_all.head(50))
+
+            # Aggregate stats
+            st.markdown("### Aggregate stats")
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.metric("Total results", len(df_all))
+            with col_b:
+                unique_users = df_all["username"].nunique() if "username" in df_all.columns else 0
+                st.metric("Unique users", unique_users)
+            with col_c:
+                avg_len = df_all["input_length"].mean() if not df_all["input_length"].empty else 0
+                st.metric("Avg input length", f"{avg_len:.1f}")
+
+            # Chart: input length distribution
+            st.markdown("### Input length distribution")
+            hist = alt.Chart(df_all).mark_bar().encode(
+                alt.X("input_length:Q", bin=alt.Bin(maxbins=30)),
+                y="count()",
+                tooltip=["count()"]
+            ).properties(width=700, height=300)
+            st.altair_chart(hist)
+
+            # Chart: inputs over time
+            st.markdown("### Inputs over time (last 90 days)")
+            df_time = df_all.dropna(subset=["created_at"])
+            if not df_time.empty:
+                df_time_recent = df_time[df_time["created_at"] >= (pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=90))]
+                line = alt.Chart(df_time_recent).mark_line(point=True).encode(
+                    x=alt.X("created_at:T", title="Created at"),
+                    y=alt.Y("count():Q", title="Count"),
+                    color="username:N",
+                    tooltip=["username", "count()"]
+                ).properties(width=800, height=350)
+                st.altair_chart(line)
+            else:
+                st.info("Not enough timestamped data to show time chart.")
+
+            # Export all results (Admin)
+            to_export = df_all.copy()
+            # remove raw object ids
+            if "_id" in to_export.columns:
+                to_export = to_export.drop(columns=["_id"])
+            csv_all = to_export.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download ALL results as CSV (Admin)", csv_all, "all_results.csv", "text/csv")
+    except Exception as e:
+        st.error(f"Admin analysis failed: {e}")
 
 # ---------- User page ----------
 st.header("User Page")
@@ -209,7 +328,7 @@ with st.form("input_form"):
     text = st.text_input("Enter some text")
     submit = st.form_submit_button("Submit")
     if submit:
-        if not text.strip():
+        if not (text and text.strip()):
             st.error("Please enter some text.")
         else:
             try:
@@ -228,14 +347,82 @@ with st.form("input_form"):
 
 st.markdown("### Your recent outputs")
 try:
-    recent = list(results_col.find({"username": user["username"]}).sort([("_id", -1)]).limit(10))
+    recent = list(results_col.find({"username": user["username"]}).sort([("_id", -1)]).limit(100))
     if recent:
         for r in recent:
-            st.write(f"- **Input:** {r.get('input')} → **Output:** {r.get('output')}")
+            st.write(f"- **Input:** {r.get('input')} → **Output:** {r.get('output')}  *(at {r.get('created_at')})*")
     else:
         st.info("No results yet.")
 except Exception as e:
     st.error(f"Could not fetch results: {e}")
+
+st.markdown("---")
+
+# ---------- Per-user cleaning, transform, download & visualize ----------
+st.subheader("My Data — Clean, Transform, Export & Visualize")
+try:
+    my_results = list(results_col.find({"username": user["username"]}).sort([("_id", -1)]))
+    if not my_results:
+        st.info("You have no saved results yet.")
+    else:
+        df_me = pd.DataFrame(my_results)
+        # Clean & transform
+        if "_id" in df_me.columns:
+            df_me["_id_str"] = df_me["_id"].astype(str)
+        df_me["input"] = df_me.get("input", "").apply(lambda x: normalize_text(x) if pd.notna(x) else "")
+        df_me["output"] = df_me.get("output", "").apply(lambda x: normalize_text(x) if pd.notna(x) else "")
+        df_me["created_at"] = pd.to_datetime(df_me["created_at"], errors="coerce")
+        df_me["input_length"] = df_me["input"].apply(lambda x: len(x) if pd.notna(x) else 0)
+        # Additional transforms (example): reversed normalized input saved as column
+        df_me["input_reversed_norm"] = df_me["input"].apply(lambda x: x[::-1] if pd.notna(x) else "")
+
+        st.write("Cleaned preview")
+        st.dataframe(df_me[["input", "output", "created_at", "input_length"]].head(50))
+
+        # CSV download (user)
+        export_df = df_me.drop(columns=[c for c in df_me.columns if c == "_id"], errors='ignore')
+        csv = export_df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download My Data as CSV", csv, f"{user['username']}_results.csv", "text/csv")
+
+        # Visualization: input length over time
+        st.markdown("#### Input length over time")
+        df_time = df_me.dropna(subset=["created_at"])
+        if not df_time.empty and len(df_time) >= 1:
+            chart = (
+                alt.Chart(df_time)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("created_at:T", title="Created at"),
+                    y=alt.Y("input_length:Q", title="Input length"),
+                    tooltip=["input", "output", "created_at"]
+                )
+                .properties(width=700, height=300)
+            )
+            st.altair_chart(chart)
+        else:
+            st.info("Not enough data points to visualize input length over time.")
+
+        # Visualization: input length histogram
+        st.markdown("#### Input length histogram")
+        hist = alt.Chart(df_me).mark_bar().encode(
+            alt.X("input_length:Q", bin=alt.Bin(maxbins=20)),
+            y="count()",
+            tooltip=["count()"]
+        ).properties(width=700, height=300)
+        st.altair_chart(hist)
+
+        # Simple textual analysis: most common words in inputs (basic)
+        st.markdown("#### Top tokens (basic)")
+        all_input_text = " ".join(df_me["input"].astype(str).tolist())
+        tokens = re.findall(r"\w+", all_input_text)
+        tokens = [t for t in tokens if len(t) > 1]  # filter single-char tokens
+        if tokens:
+            top_tokens = pd.Series(tokens).value_counts().head(10).rename_axis("token").reset_index(name="count")
+            st.table(top_tokens)
+        else:
+            st.info("No tokens to analyze.")
+except Exception as e:
+    st.error(f"My data analysis failed: {e}")
 
 st.markdown("---")
 st.caption("Demo app — change the admin password after first login.")
